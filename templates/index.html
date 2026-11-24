@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>窄带组播补传演练</title>
+<style>
+  body { font-family: system-ui, "Noto Sans CJK SC", sans-serif; margin: 1.5rem auto; max-width: 1080px; color: #222; }
+  h1 { font-size: 1.4rem; } h2 { font-size: 1.1rem; border-bottom: 2px solid #4682b4; padding-bottom: .2rem; margin-top: 2rem; }
+  table { border-collapse: collapse; margin: .6rem 0; }
+  th, td { border: 1px solid #bbb; padding: .3rem .6rem; font-size: .92rem; text-align: left; }
+  th { background: #eaf2f8; }
+  .flash { background: #fff8dc; border: 1px solid #d6c656; padding: .5rem .8rem; margin: .6rem 0; border-radius: 4px; }
+  .ok { color: #1a7f1a; font-weight: 600; } .bad { color: #b03030; font-weight: 600; }
+  .card { border: 1px solid #ccc; border-radius: 6px; padding: .8rem 1rem; margin: .8rem 0; }
+  code { background: #f2f2f2; padding: 0 .3em; border-radius: 3px; }
+  .frames li, .small { font-size: .9rem; }
+  label { white-space: nowrap; }
+</style>
+</head>
+<body>
+<h1>站台终端窄带组播补传演练</h1>
+
+{% with msgs = get_flashed_messages() %}
+  {% for m in msgs %}<div class="flash">{{ m }}</div>{% endfor %}
+{% endwith %}
+
+<h2>1. 上传新图（≤ {{ max_chunks * chunk_size }} 字节，按 {{ chunk_size }} 字节切块，至多 {{ max_chunks }} 块）</h2>
+<form method="post" action="{{ url_for('upload') }}" enctype="multipart/form-data">
+  <input type="file" name="image" required>
+  <button type="submit">上传并重开演练</button>
+</form>
+{% if image %}
+<div class="card">
+  <div>新图：<b>{{ image.name }}</b>（{{ image.size }} 字节，{{ image.n_chunks }} 块）
+    <a href="{{ url_for('download_new') }}">下载新图</a></div>
+  <div class="small">SHA-256：<code>{{ image.sha256 }}</code></div>
+  <div class="small">块号：{% for c in range(1, image.n_chunks + 1) %}#{{ c }}{% if not loop.last %}、{% endif %}{% endfor %}
+    （每块 {{ chunk_size }} 字节，末块补零，重组按原长截断）</div>
+</div>
+{% endif %}
+
+{% if image %}
+<h2>2. 登记终端首播实收块号（启用 {{ min_terminals }}~{{ max_terminals }} 台）</h2>
+<form method="post" action="{{ url_for('setup_terminals') }}">
+  <table>
+    <tr><th>启用</th><th>终端名</th><th>首播实收块号（勾选）</th></tr>
+    {% for i in term_rows %}
+    <tr>
+      <td><input type="checkbox" name="enable_{{ i }}" {% if i < 2 %}checked{% endif %}></td>
+      <td><input type="text" name="name_{{ i }}" value="T{{ i + 1 }}" size="6"></td>
+      <td>
+        {% for c in range(1, image.n_chunks + 1) %}
+        <label><input type="checkbox" name="recv_{{ i }}" value="{{ c }}">#{{ c }}</label>
+        {% endfor %}
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+  <button type="submit">登记终端（清空已有轮次）</button>
+</form>
+{% endif %}
+
+{% if terminals %}
+<h2>3. 各站当前状态</h2>
+<table>
+  <tr><th>终端</th><th>已收块</th><th>缺块</th><th>累计解码</th><th>新图校验</th><th>当前可下载图</th></tr>
+  {% for t in terminals %}
+  <tr>
+    <td>{{ t.name }}</td>
+    <td>{% for c in t.owned %}#{{ c}} {% endfor %}</td>
+    <td>{% if t.missing %}{% for c in t.missing %}#{{ c }} {% endfor %}{% else %}<span class="ok">无</span>{% endif %}</td>
+    <td>{{ t.total_decodes }}</td>
+    <td>{% if t.completed %}<span class="ok">SHA-256 相符，已替换旧图</span>{% else %}<span class="bad">未收齐</span>{% endif %}</td>
+    <td><a href="{{ url_for('download', tid=loop.index0) }}">下载</a></td>
+  </tr>
+  {% endfor %}
+</table>
+
+<h2>4. 新一轮补传（按本轮无丢帧推算，限额内收不齐则报无方案、保留已收块）</h2>
+<form method="post" action="{{ url_for('run_round') }}">
+  <div class="card">
+    <label>本轮广播帧数上限 <input type="number" name="frame_limit" min="1" max="{{ max_frame_limit }}" value="{{ image.n_chunks }}" required></label>
+    （硬顶 {{ max_frame_limit }}）
+  </div>
+  <div class="card">
+    各终端异或解码额度：
+    {% for t in terminals %}
+    <label>{{ t.name }} <input type="number" name="quota_{{ loop.index0 }}" min="0" max="{{ max_chunks }}" value="1" style="width:4em"></label>
+    {% endfor %}
+  </div>
+  <div class="card">
+    漏帧注入（可选）：
+    <select name="fault_terminal">
+      <option value="">无</option>
+      {% for t in terminals %}<option value="{{ loop.index0 }}">{{ t.name }}</option>{% endfor %}
+    </select>
+    漏收本轮第 <input type="number" name="fault_frame" min="1" style="width:4em"> 帧
+  </div>
+  <button type="submit">规划并发送本轮</button>
+</form>
+{% endif %}
+
+{% if rounds %}
+<h2>5. 轮次历史</h2>
+{% for r in rounds %}
+<div class="card">
+  <b>第 {{ r.no }} 轮</b>（帧数上限 {{ r.frame_limit }}，实发 {{ r.frames|length }} 帧）
+  {% if r.fault %}<span class="bad">　漏帧注入：{{ r.fault[0] }} 漏收第 {{ r.fault[1] }} 帧</span>{% endif %}
+  <ol class="frames">
+    {% for f in r.frames %}<li>{{ f }}</li>{% endfor %}
+  </ol>
+  <table>
+    <tr><th>终端</th><th>轮前缺块</th><th>实收帧</th><th>解回块（帧号→块）</th><th>解码次数/额度</th><th>轮后缺块</th><th>结果</th></tr>
+    {% for t in r.terminals %}
+    <tr>
+      <td>{{ t.name }}</td>
+      <td>{% for c in t.before_missing %}#{{ c }} {% endfor %}{% if not t.before_missing %}无{% endif %}</td>
+      <td>
+        {% if t.missed_frame %}<span class="bad">漏收第{{ t.missed_frame }}帧；</span>{% endif %}
+        {% for no in t.received %}{{ no }} {% endfor %}{% if not t.received %}无{% endif %}
+      </td>
+      <td>{% for no, c in t.decoded %}第{{ no }}帧→#{{ c }} {% endfor %}{% if not t.decoded %}—{% endif %}</td>
+      <td>{{ t.decodes }}/{{ t.quota }}</td>
+      <td>{% if t.after_missing %}{% for c in t.after_missing %}#{{ c }} {% endfor %}{% else %}<span class="ok">无</span>{% endif %}</td>
+      <td>{% if t.just_completed %}<span class="ok">收齐，SHA-256 相符，已替换旧图</span>
+          {% elif t.completed %}<span class="ok">此前已收齐</span>
+          {% else %}<span class="bad">未收齐</span>{% endif %}</td>
+    </tr>
+    {% endfor %}
+  </table>
+</div>
+{% endfor %}
+{% endif %}
+
+<form method="post" action="{{ url_for('reset') }}" onsubmit="return confirm('确定清空整场演练？');">
+  <button type="submit">重置演练</button>
+</form>
+</body>
+</html>
